@@ -1,0 +1,15 @@
+/* 计划状态表与待复核队列样式，由 index.html 单独引入，与页面基础样式分开维护。 */
+.status-table{border-collapse:collapse;width:100%;font-size:14px}
+.status-table th,.status-table td{border-bottom:1px solid #e2e8f0;padding:8px 10px;text-align:left}
+.status-table th{background:#eef2f7;color:#334155;font-weight:600}
+.status-table tbody tr:hover td{background:#f8fafc}
+.st{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
+.st-draft{background:#e2e8f0;color:#475569}
+.st-submitted{background:#dbeafe;color:#1d4ed8}
+.st-approved{background:#dcfce7;color:#15803d}
+.st-under-review{background:#fef3c7;color:#b45309}
+.st-rejected{background:#fee2e2;color:#b91c1c}
+.st-canceled,.st-expired{background:#e5e7eb;color:#6b7280}
+.recheck-table th{background:#fef3c7;color:#92400e}
+.recheck-table td{font-variant-numeric:tabular-nums}
+.empty{color:#64748b;margin:4px 0}

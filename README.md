@@ -1,6 +1,8 @@
 # 无人机飞行计划审批与空域协调系统
 
-标准库独立项目。系统记录运营方计划、航线、载荷、高度、人口风险和应急方案，检查临时禁飞区、高度范围、人口风险以及相邻有效计划冲突。审核结果支持离线编号幂等回传，计划变更会使原批准失效并生成通知。
+标准库独立项目。系统记录运营方计划、航线、载荷、高度、人口风险和应急方案，检查临时禁飞区、高度范围、人口风险以及相邻有效计划冲突。审核结果支持离线编号幂等回传，计划变更会使原批准失效并生成通知。新限制发布会触发空域变更复核：时空重叠的已批准计划转入待复核（`under_review`），原批准留档但暂停放行；冲突解除后审核员按当前版本和处置说明恢复批准，运营方变更航线、高度或时段则退回草稿重新提交。
+
+复核规则（`recheck_rules.py`）、待复核状态存储（`recheck_store.py`）与接口入口（`app.py`）分开维护；协调台展示待复核队列，计划状态表样式单独放在 `static/status.css`。
 
 ## 运行
 
@@ -14,13 +16,16 @@ python3 app.py --db drone_airspace.db
 
 ## 主要接口
 
-- `POST /api/restrictions`：新增临时限制或禁飞区。
+- `POST /api/restrictions`：新增临时限制或禁飞区；时空重叠的已批准计划自动转入待复核并通知运营方。
+- `POST /api/restrictions/{id}/lift`：解除限制。
 - `POST /api/plans`：创建飞行计划。
 - `GET /api/plans/{id}/check`：检查硬约束和相邻交通冲突。
 - `POST /api/plans/{id}/submit`、`approve`、`reject`：提交和审核；审核使用 `offline_id` 保证断网重连幂等。
-- `POST /api/plans/{id}/change`、`cancel`：版本化变更与取消，并生成通知。
-- `GET /api/notifications`、`POST /api/expire`：通知与到期处理。
-- `GET /api/state`：按角色返回计划、限制和公开信息。
+- `POST /api/plans/{id}/reinstate`：空域变更复核，按 `expected_revision` 和 `disposition` 恢复批准；检查不通过则保持待复核。
+- `POST /api/plans/{id}/change`、`cancel`：版本化变更与取消，并生成通知；待复核计划变更会退回草稿并关闭旧复核单。
+- `GET /api/rechecks`：待复核队列（审核角色看全部，运营方看自己的）。
+- `GET /api/notifications`、`POST /api/expire`：通知与到期处理（待复核计划到期一并过期并关闭复核单）。
+- `GET /api/state`：按角色返回计划、限制、待复核队列和公开信息。
 
 ## 测试
 
