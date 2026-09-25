@@ -1,3 +1,38 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<link rel="stylesheet" href="/static/status-table.css">
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px;cursor:pointer}h2{margin-top:0}</style>
+<h1>无人机空域协调台</h1><p>查看飞行计划、空域限制与待复核队列。提交、审核、变更、恢复批准和紧急授权通过 JSON API 完成。</p>
+<section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button></section>
+<section><h2>待复核队列</h2><div id="queue">加载中…</div></section>
+<section><h2>计划状态表</h2><div id="plans">加载中…</div></section>
+<section><h2>原始状态</h2><pre id="o"></pre></section>
+<script>
+const H=()=>({'X-User-Id':u.value,'X-Role':r.value});
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const pill=st=>`<span class="status-pill ${st}">${st}</span>`;
+function planTable(list){
+  if(!list.length)return '暂无计划';
+  return `<table class="status-table"><tr><th>ID</th><th>呼号</th><th>运营方</th><th>起飞</th><th>结束</th><th>高度</th><th>状态</th></tr>`+
+    list.map(p=>`<tr><td>${p.id}</td><td>${esc(p.callsign)}</td><td>${esc(p.operator_id)}</td><td>${p.starts_at}</td><td>${p.ends_at}</td><td>${p.max_altitude}</td><td>${pill(p.status)}</td></tr>`).join('')+`</table>`;
+}
+function queueTable(list){
+  if(!list.length)return '暂无待复核计划';
+  return `<table class="status-table"><tr><th>ID</th><th>呼号</th><th>运营方</th><th>版本</th><th>起飞</th><th>操作</th></tr>`+
+    list.map(p=>`<tr><td>${p.id}</td><td>${esc(p.callsign)}</td><td>${esc(p.operator_id)}</td><td>${p.revision}</td><td>${p.starts_at}</td><td><button onclick="reinstate(${p.id},${p.revision})">恢复批准</button></td></tr>`).join('')+`</table>`;
+}
+async function load(){
+  const s=await (await fetch('/api/state',{headers:H()})).json();
+  o.textContent=JSON.stringify(s,null,2);
+  plans.innerHTML=s.plans?planTable(s.plans):'(无权限或暂无数据)';
+  const q=await (await fetch('/api/recheck/queue',{headers:H()})).json();
+  queue.innerHTML=q.error?`（${esc(q.message)}）`:queueTable(q.queue);
+}
+async function reinstate(id,rev){
+  const disposition=prompt('处置说明（复核结论）');if(!disposition)return;
+  const res=await fetch(`/api/plans/${id}/reinstate`,{method:'POST',headers:{...H(),'Content-Type':'application/json'},body:JSON.stringify({expected_revision:rev,disposition})});
+  const data=await res.json();
+  alert(data.error?`${data.error}: ${data.message}`:(data.reinstated?'已恢复批准':'检查未通过，继续保持待复核'));
+  load();
+}
+load()
+</script>

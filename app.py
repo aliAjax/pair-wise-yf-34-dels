@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import recheck
+
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
@@ -130,7 +132,39 @@ class DroneAirspaceService:
         with self.repo.tx() as conn:
             cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,created_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
-            return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+            restriction = dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+            suspended = self._suspend_overlapping_plans(conn, restriction, actor, role)
+            return {**restriction, "suspended_plan_ids": suspended}
+
+    def _suspend_overlapping_plans(self, conn: sqlite3.Connection, restriction: dict[str, Any], actor: str, role: str) -> list[int]:
+        """限制发布后，把时空重叠的有效计划转入待复核：原批准留档但不可放行，并通知运营方。"""
+        marks = ",".join("?" * len(recheck.SUSPENDABLE_STATUSES))
+        rows = conn.execute(f"SELECT * FROM flight_plans WHERE status IN ({marks})", recheck.SUSPENDABLE_STATUSES).fetchall()
+        r_start, r_end = parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])
+        suspended: list[int] = []
+        for plan in rows:
+            if not recheck.should_suspend(plan["status"]): continue
+            bbox = route_bbox(self._route(plan))
+            if not recheck.restriction_hits_plan(restriction, bbox, parse_time(plan["starts_at"]), parse_time(plan["ends_at"]), plan["max_altitude"]): continue
+            conn.execute("UPDATE flight_plans SET status=?,updated_at=? WHERE id=?", (recheck.PENDING_REVIEW, iso(), plan["id"]))
+            Repository.audit(conn, plan["id"], actor, role, "plan_suspended_for_recheck",
+                             {"restriction_id": restriction["id"], "restriction_name": restriction["name"], "revision": plan["revision"]})
+            Repository.notify(conn, plan["id"], "recheck_required",
+                              f"飞行计划 {plan['callsign']} 与新发布限制「{restriction['name']}」时空重叠，已转入待复核，原批准留档但不可放行")
+            suspended.append(plan["id"])
+        return suspended
+
+    def lift_restriction(self, restriction_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以解除限制")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "解除原因必填")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            if not row: raise ApiError(404, "restriction_not_found", "限制不存在")
+            if row["status"] != "active": return {"restriction": dict(row), "idempotent": True}
+            conn.execute("UPDATE restrictions SET status='lifted' WHERE id=?", (restriction_id,))
+            Repository.audit(conn, None, actor, role, "restriction_lifted", {"restriction_id": restriction_id, "name": row["name"], "reason": reason})
+            return {"restriction": dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()), "idempotent": False}
 
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
@@ -175,13 +209,9 @@ class DroneAirspaceService:
         if plan["max_altitude"] > 120: hard.append({"code": "altitude_limit", "message": "常规计划高度不得超过 120m"})
         if plan["population_risk"] > 3: blocking.append({"code": "population_risk", "risk": plan["population_risk"], "message": "人口风险超过常规批准阈值"})
         for restriction in conn.execute("SELECT * FROM restrictions WHERE status='active'"):
-            rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
-            if not boxes_overlap(bbox, rbox): continue
-            if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): continue
-            altitude_overlap = plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0
-            if altitude_overlap:
-                item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
-                blocking.append(item)
+            if not recheck.restriction_hits_plan(restriction, bbox, start, end, plan["max_altitude"]): continue
+            item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
+            blocking.append(item)
         adjacent: list[dict[str, Any]] = []
         for other in conn.execute("SELECT * FROM flight_plans WHERE id!=? AND status IN ('submitted','approved') AND starts_at<? AND ends_at>?", (plan["id"], iso(end), iso(start))):
             if boxes_overlap(bbox, route_bbox(self._route(other)), 0.002):
@@ -255,6 +285,33 @@ class DroneAirspaceService:
             Repository.notify(conn, plan_id, "rejected", f"飞行计划 {plan['callsign']} 被拒绝：{reason}")
             return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False}
 
+    def reinstate(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """冲突解除后按当前版本和处置说明恢复批准；检查不通过则继续保持待复核。"""
+        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "recheck_forbidden", "只有空域审核员或指挥官可以恢复批准")
+        expected, disposition = body.get("expected_revision"), str(body.get("disposition", "")).strip()
+        offline_id = str(body.get("offline_id", "")).strip()
+        if not isinstance(expected, int) or not disposition: raise ApiError(400, "recheck_details_required", "expected_revision 和处置说明 disposition 必填")
+        with self.repo.tx() as conn:
+            if offline_id:
+                prior = conn.execute("SELECT * FROM approvals WHERE offline_id=?", (offline_id,)).fetchone()
+                if prior:
+                    if prior["plan_id"] == plan_id and prior["plan_revision"] == expected and prior["decision"] == "reinstated":
+                        return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True, "reinstated": True, "approval_id": prior["id"]}
+                    raise ApiError(409, "offline_id_conflict", "该离线审核编号已经用于其他决定")
+            plan = self._plan_row(conn, plan_id)
+            if plan["status"] != recheck.PENDING_REVIEW: raise ApiError(409, "invalid_transition", "只有待复核计划可以恢复批准")
+            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化，请按当前版本复核")
+            report = self._conflict_report(conn, plan)
+            if not recheck.can_reinstate(report):
+                Repository.audit(conn, plan_id, actor, role, "recheck_maintained", {"revision": expected, "disposition": disposition, "conflicts": report["blocking_conflicts"]})
+                return {"plan": self.get_plan(plan_id, role, ""), "reinstated": False, "report": report}
+            cur = conn.execute("INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                               (plan_id, expected, actor, "reinstated", disposition, offline_id or None, iso()))
+            conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
+            Repository.audit(conn, plan_id, actor, role, "plan_reinstated", {"revision": expected, "disposition": disposition})
+            Repository.notify(conn, plan_id, "reinstated", f"飞行计划 {plan['callsign']} 复核通过，批准已恢复：{disposition}")
+            return {"plan": self.get_plan(plan_id, role, ""), "reinstated": True, "approval_id": cur.lastrowid}
+
     def change(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "change_forbidden", "只有运营方可以变更计划")
         expected = body.get("expected_revision")
@@ -275,6 +332,7 @@ class DroneAirspaceService:
                          (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
             if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
+            elif plan["status"] == recheck.PENDING_REVIEW: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已退回草稿并更新，需重新提交审核")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
 
@@ -303,12 +361,17 @@ class DroneAirspaceService:
         if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "expire_forbidden", "当前角色不能执行到期处理")
         now = iso()
         with self.repo.tx() as conn:
-            rows = list(conn.execute("SELECT * FROM flight_plans WHERE status='approved' AND ends_at<=?", (now,)))
+            rows = list(conn.execute("SELECT * FROM flight_plans WHERE status IN ('approved',?) AND ends_at<=?", (recheck.PENDING_REVIEW, now)))
             for row in rows:
                 conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
                 Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
                 Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
         return {"expired": len(rows)}
+
+    def recheck_queue(self, role: str) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander", "auditor"}: raise ApiError(403, "queue_forbidden", "当前角色不能查看待复核队列")
+        rows = self.repo.conn.execute("SELECT * FROM flight_plans WHERE status=? ORDER BY updated_at", (recheck.PENDING_REVIEW,))
+        return {"queue": [self.get_plan(row["id"], role, "") for row in rows], "server_time": iso()}
 
     def state(self, role: str, operator: str) -> dict[str, Any]:
         conn = self.repo.conn
@@ -341,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/recheck/queue": return 200, self.service.recheck_queue(role)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
@@ -350,12 +414,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
+        if len(parts) == 4 and parts[:2] == ["api", "restrictions"] and parts[2].isdigit() and parts[3] == "lift":
+            return 200, self.service.lift_restriction(int(parts[2]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             pid, action = int(parts[2]), parts[3]
             routes = {
                 "submit": lambda: self.service.submit(pid, actor, role, operator, body),
                 "approve": lambda: self.service.approve(pid, actor, role, body),
                 "reject": lambda: self.service.reject(pid, actor, role, body),
+                "reinstate": lambda: self.service.reinstate(pid, actor, role, body),
                 "change": lambda: self.service.change(pid, actor, role, operator, body),
                 "cancel": lambda: self.service.cancel(pid, actor, role, operator, body),
             }
@@ -366,6 +433,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and parsed.path.startswith("/static/"):
+                target = (self.web_root / parsed.path.removeprefix("/static/")).resolve()
+                if not target.is_file() or target.parent != self.web_root.resolve(): raise ApiError(404, "not_found", "静态资源不存在")
+                mime = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".html": "text/html; charset=utf-8"}.get(target.suffix, "application/octet-stream")
+                raw = target.read_bytes(); self.send_response(200); self.send_header("Content-Type", mime); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path); send_json(self, status, payload)
         except ApiError as exc:
             payload = {"error": exc.code, "message": exc.message}
